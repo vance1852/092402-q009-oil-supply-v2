@@ -135,6 +135,28 @@ CREATE TABLE IF NOT EXISTS allocation_runs (
     UNIQUE(route_id, service_date, input_sha256)
 );
 
+CREATE TABLE IF NOT EXISTS route_calendars (
+    route_id TEXT PRIMARY KEY REFERENCES routes(route_id),
+    current_revision INTEGER NOT NULL DEFAULT 0,
+    definition_json TEXT NOT NULL,
+    definition_sha256 TEXT NOT NULL,
+    updated_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS route_calendar_revisions (
+    revision_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    route_id TEXT NOT NULL REFERENCES routes(route_id),
+    calendar_revision INTEGER NOT NULL,
+    definition_json TEXT NOT NULL,
+    definition_sha256 TEXT NOT NULL,
+    tzdata_version TEXT NOT NULL,
+    change_summary TEXT NOT NULL DEFAULT '',
+    created_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    created_at TEXT NOT NULL,
+    UNIQUE(route_id, calendar_revision)
+);
+
 CREATE TABLE IF NOT EXISTS transfers (
     transfer_id TEXT PRIMARY KEY,
     nomination_id TEXT NOT NULL UNIQUE REFERENCES nominations(nomination_id),
@@ -143,11 +165,40 @@ CREATE TABLE IF NOT EXISTS transfers (
     expected_delivered_barrels TEXT NOT NULL,
     departed_at TEXT NOT NULL,
     arrived_at TEXT,
-    state TEXT NOT NULL DEFAULT 'in_transit' CHECK(state IN ('in_transit','delivered','disputed')),
+    state TEXT NOT NULL DEFAULT 'in_transit'
+        CHECK(state IN ('in_transit','partial','quality_hold','delivered','completed','disputed','overdue')),
     revision INTEGER NOT NULL DEFAULT 1,
+    -- 发运时刻冻结的日历版本；日历后续修订不会改变这些承诺。
+    calendar_revision INTEGER,
+    calendar_sha256 TEXT,
+    tzdata_version TEXT,
+    window_opens_at TEXT,
+    scheduled_acceptance_at TEXT,
+    committed_due_at TEXT,
+    is_overdue INTEGER NOT NULL DEFAULT 0 CHECK(is_overdue IN (0,1)),
+    overdue_since TEXT,
     created_by TEXT NOT NULL REFERENCES supply_users(user_id),
     created_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS transfer_receipts (
+    receipt_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    transfer_id TEXT NOT NULL REFERENCES transfers(transfer_id),
+    stage TEXT NOT NULL CHECK(stage IN ('partial','quality_pending','final')),
+    quantity_barrels TEXT NOT NULL,
+    quality_state TEXT NOT NULL DEFAULT 'pending'
+        CHECK(quality_state IN ('pending','accepted','rejected')),
+    scan_code TEXT NOT NULL UNIQUE,
+    note TEXT NOT NULL DEFAULT '',
+    recorded_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    recorded_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_receipts_transfer
+ON transfer_receipts(transfer_id, receipt_id);
+
+CREATE INDEX IF NOT EXISTS idx_transfers_overdue
+ON transfers(is_overdue, committed_due_at);
 
 CREATE TABLE IF NOT EXISTS supply_scenarios (
     scenario_id TEXT PRIMARY KEY,
@@ -198,7 +249,9 @@ ON supply_audit_events(entity_type, entity_id, event_id);
 
 
 def connect(path: str | Path) -> sqlite3.Connection:
-    connection = sqlite3.connect(str(path), isolation_level=None, timeout=10)
+    # check_same_thread=False：线程化 HTTP 服务器的多个工作线程共享连接，
+    # 由调用方（API 层的锁）串行化使用。
+    connection = sqlite3.connect(str(path), isolation_level=None, timeout=10, check_same_thread=False)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys=ON")
     connection.execute("PRAGMA journal_mode=WAL")
@@ -208,7 +261,58 @@ def connect(path: str | Path) -> sqlite3.Connection:
 
 
 def initialize(connection: sqlite3.Connection) -> None:
+    legacy_pending = _stage_legacy_transfers(connection)
     connection.executescript(SCHEMA)
+    if legacy_pending:
+        _copy_legacy_transfers(connection)
+
+
+def _transfers_columns(connection: sqlite3.Connection) -> set[str]:
+    return {row["name"] for row in connection.execute("PRAGMA table_info(transfers)").fetchall()}
+
+
+def _stage_legacy_transfers(connection: sqlite3.Connection) -> bool:
+    """旧库的 transfers 缺少日历列时先改名，让 SCHEMA 可以创建新表。"""
+    columns = _transfers_columns(connection)
+    if not columns or "calendar_revision" in columns:
+        return False
+    connection.execute("PRAGMA foreign_keys=OFF")
+    connection.execute("BEGIN")
+    try:
+        connection.execute("ALTER TABLE transfers RENAME TO transfers_legacy")
+    except BaseException:
+        connection.rollback()
+        connection.execute("PRAGMA foreign_keys=ON")
+        raise
+    else:
+        connection.commit()
+    return True
+
+
+def _copy_legacy_transfers(connection: sqlite3.Connection) -> None:
+    """把旧 transfers 数据搬进新表并校验外键，整个过程在一个事务内。"""
+    connection.execute("BEGIN")
+    try:
+        connection.execute(
+            """
+INSERT INTO transfers(transfer_id,nomination_id,inventory_lot_id,loaded_barrels,
+    expected_delivered_barrels,departed_at,arrived_at,state,revision,created_by,created_at)
+SELECT transfer_id,nomination_id,inventory_lot_id,loaded_barrels,
+    expected_delivered_barrels,departed_at,arrived_at,state,revision,created_by,created_at
+FROM transfers_legacy
+"""
+        )
+        connection.execute("DROP TABLE transfers_legacy")
+        failures = connection.execute("PRAGMA foreign_key_check").fetchall()
+        if failures:
+            raise sqlite3.DatabaseError(f"transfers 迁移后外键检查失败: {failures!r}")
+    except BaseException:
+        connection.rollback()
+        raise
+    else:
+        connection.commit()
+    finally:
+        connection.execute("PRAGMA foreign_keys=ON")
 
 
 @contextmanager

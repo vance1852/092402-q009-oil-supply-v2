@@ -223,6 +223,35 @@ class NominationRequest:
 
 
 @dataclass(frozen=True, slots=True)
+class ReceiptRequest:
+    transfer_id: str
+    stage: str
+    quantity_barrels: Decimal
+    scan_code: str
+    note: str
+
+    STAGES = ("partial", "quality_pending", "final")
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "ReceiptRequest":
+        stage = required_text(raw.get("stage"), "stage", 24).lower()
+        if stage not in cls.STAGES:
+            raise ValidationFailed("stage 必须是 partial、quality_pending 或 final")
+        note = raw.get("note", "")
+        if not isinstance(note, str) or len(note) > 512:
+            raise ValidationFailed("note 必须是不超过 512 字符的字符串")
+        return cls(
+            transfer_id=identifier(raw.get("transfer_id"), "transfer_id"),
+            stage=stage,
+            quantity_barrels=decimal_value(
+                raw.get("quantity_barrels"), "quantity_barrels", minimum=Decimal("0.001")
+            ),
+            scan_code=identifier(raw.get("scan_code"), "scan_code"),
+            note=note.strip(),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class SupplyScenario:
     scenario_id: str
     name: str

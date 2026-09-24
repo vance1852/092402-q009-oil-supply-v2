@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import threading
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -24,6 +25,8 @@ class Response:
 class JsonApplication:
     def __init__(self, service: SupplyService) -> None:
         self.service = service
+        # SQLite 连接不能跨线程并发使用，线程化服务器需要串行化写读请求。
+        self._lock = threading.RLock()
 
     @staticmethod
     def _actor(headers: Mapping[str, str]) -> str:
@@ -45,6 +48,10 @@ class JsonApplication:
         return value
 
     def handle(self, method: str, target: str, headers: Mapping[str, str] | None = None, body: bytes = b"") -> Response:
+        with self._lock:
+            return self._handle_locked(method, target, headers, body)
+
+    def _handle_locked(self, method: str, target: str, headers: Mapping[str, str] | None = None, body: bytes = b"") -> Response:
         normalized = {key.lower(): value for key, value in (headers or {}).items()}
         parsed = urlparse(target)
         path = parsed.path.rstrip("/") or "/"
@@ -65,6 +72,14 @@ class JsonApplication:
                 return Response(201, self.service.create_facility(actor, payload))
             if method == "POST" and path == "/routes":
                 return Response(201, self.service.create_route(actor, payload))
+            if method == "PUT" and len(parts) == 3 and parts[0] == "routes" and parts[2] == "calendar":
+                return Response(200, self.service.configure_route_calendar(actor, parts[1], payload, payload.get("change_summary", "")))
+            if method == "GET" and len(parts) == 3 and parts[0] == "routes" and parts[2] == "calendar":
+                return Response(200, self.service.route_calendar(parts[1]))
+            if method == "GET" and len(parts) == 4 and parts[0] == "routes" and parts[2] == "calendar" and parts[3] == "revisions":
+                return Response(200, self.service.calendar_revisions(actor, parts[1]))
+            if method == "POST" and len(parts) == 4 and parts[0] == "routes" and parts[2] == "calendar" and parts[3] == "preview":
+                return Response(200, self.service.preview_calendar_change(actor, parts[1], payload))
             if method == "POST" and len(parts) == 3 and parts[0] == "routes" and parts[2] == "outages":
                 return Response(201, self.service.announce_outage(actor, parts[1], payload["starts_at"], payload.get("ends_at"), payload["capacity_percent"], payload["reason"]))
             if method == "POST" and path == "/inventory/lots":
@@ -77,6 +92,12 @@ class JsonApplication:
                 return Response(200, self.service.allocate(actor, parts[1], payload["service_date"]))
             if method == "POST" and path == "/transfers":
                 return Response(201, self.service.dispatch_transfer(actor, payload["transfer_id"], payload["nomination_id"], payload["lot_id"], int(payload["expected_revision"])))
+            if method == "GET" and len(parts) == 2 and parts[0] == "transfers":
+                return Response(200, self.service.transfer_status(parts[1]))
+            if method == "POST" and path == "/transfers/receipts":
+                return Response(201, self.service.record_receipt(actor, payload))
+            if method == "POST" and path == "/transfers/overdue/sweep":
+                return Response(200, self.service.sweep_overdue(actor))
             if method == "POST" and path == "/scenarios":
                 return Response(201, self.service.create_scenario(actor, payload))
             if method == "POST" and len(parts) == 3 and parts[0] == "scenarios" and parts[2] == "approve":
@@ -100,6 +121,9 @@ def make_handler(application: JsonApplication):
             self._dispatch()
 
         def do_POST(self) -> None:  # noqa: N802
+            self._dispatch()
+
+        def do_PUT(self) -> None:  # noqa: N802
             self._dispatch()
 
         def _dispatch(self) -> None:

@@ -5,13 +5,22 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Iterable, Mapping
 
+from .calendar_support import BusinessCalendar, tzdata_version
 from .clock import SystemClock, parse_utc, utc_text
 from .errors import Conflict, Forbidden, InvalidState, NotFound, ValidationFailed
-from .models import IndexQuote, Facility, InventoryLot, NominationRequest, Route, SupplyScenario
+from .models import (
+    IndexQuote,
+    Facility,
+    InventoryLot,
+    NominationRequest,
+    ReceiptRequest,
+    Route,
+    SupplyScenario,
+)
 from .planning import (
     AllocationRequest,
     PricePoint,
@@ -31,8 +40,8 @@ from .storage import initialize, transaction
 
 
 ROLE_PERMISSIONS = {
-    "planner": {"quote.write", "catalog.write", "scenario.write", "scenario.run"},
-    "dispatcher": {"nomination.write", "allocation.run", "transfer.write", "inventory.write"},
+    "planner": {"quote.write", "catalog.write", "calendar.write", "scenario.write", "scenario.run"},
+    "dispatcher": {"nomination.write", "allocation.run", "transfer.write", "receipt.write", "inventory.write"},
     "risk": {"outage.write", "scenario.approve", "report.read"},
     "auditor": {"report.read", "audit.read"},
 }
@@ -61,6 +70,12 @@ class SupplyService:
         user = self._user(user_id)
         if permission not in ROLE_PERMISSIONS[user["role"]]:
             raise Forbidden(f"角色 {user['role']} 无权执行 {permission}")
+        return user
+
+    def _require_any(self, user_id: str, *permissions: str) -> sqlite3.Row:
+        user = self._user(user_id)
+        if not any(permission in ROLE_PERMISSIONS[user["role"]] for permission in permissions):
+            raise Forbidden(f"角色 {user['role']} 无权执行 {permissions[0]}")
         return user
 
     def _audit(
@@ -226,6 +241,210 @@ class SupplyService:
         if row is None:
             raise NotFound("线路不存在")
         return dict(row)
+
+    def _destination(self, route_id: str) -> sqlite3.Row:
+        return self.connection.execute(
+            "SELECT f.* FROM routes r JOIN facilities f ON f.facility_id=r.destination_id WHERE r.route_id=?",
+            (route_id,),
+        ).fetchone()
+
+    def configure_route_calendar(
+        self,
+        actor_id: str,
+        route_id: str,
+        raw: Mapping[str, Any],
+        change_summary: str = "",
+    ) -> dict[str, Any]:
+        self._require(actor_id, "calendar.write")
+        self.route(route_id)
+        calendar = BusinessCalendar.from_dict(raw)
+        destination = self._destination(route_id)
+        if calendar.timezone_name != destination["timezone"]:
+            raise Conflict("日历时区必须与终端设施时区一致")
+        if not isinstance(change_summary, str) or len(change_summary) > 256:
+            raise ValidationFailed("change_summary 必须是不超过 256 字符的字符串")
+        sha256 = calendar.definition_sha256()
+        definition = calendar.definition_json()
+        current = self.connection.execute(
+            "SELECT current_revision,definition_sha256 FROM route_calendars WHERE route_id=?",
+            (route_id,),
+        ).fetchone()
+        if current is not None and current["definition_sha256"] == sha256:
+            raise Conflict("日历定义与当前版本相同，无需修订")
+        timezone_database = tzdata_version()
+        with transaction(self.connection, immediate=True):
+            if current is None:
+                revision_number = 1
+                self.connection.execute(
+                    "INSERT INTO route_calendars(route_id,current_revision,definition_json,definition_sha256,"
+                    "updated_by,updated_at) VALUES(?,?,?,?,?,?)",
+                    (route_id, revision_number, definition, sha256, actor_id, self._now()),
+                )
+            else:
+                revision_number = int(current["current_revision"]) + 1
+                self.connection.execute(
+                    "UPDATE route_calendars SET current_revision=?,definition_json=?,definition_sha256=?,"
+                    "updated_by=?,updated_at=? WHERE route_id=?",
+                    (revision_number, definition, sha256, actor_id, self._now(), route_id),
+                )
+            self.connection.execute(
+                "INSERT INTO route_calendar_revisions(route_id,calendar_revision,definition_json,definition_sha256,"
+                "tzdata_version,change_summary,created_by,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                (
+                    route_id,
+                    revision_number,
+                    definition,
+                    sha256,
+                    timezone_database,
+                    change_summary.strip(),
+                    actor_id,
+                    self._now(),
+                ),
+            )
+            self._audit(
+                "route",
+                route_id,
+                "calendar.revised",
+                actor_id,
+                {"calendar_revision": revision_number, "definition_sha256": sha256},
+            )
+        return {
+            "route_id": route_id,
+            "calendar_revision": revision_number,
+            "calendar": json.loads(definition),
+            "definition_sha256": sha256,
+            "tzdata_version": timezone_database,
+        }
+
+    def route_calendar(self, route_id: str) -> dict[str, Any]:
+        row = self.connection.execute(
+            "SELECT c.*,r.tzdata_version FROM route_calendars c "
+            "JOIN route_calendar_revisions r ON r.route_id=c.route_id "
+            "AND r.calendar_revision=c.current_revision WHERE c.route_id=?",
+            (route_id,),
+        ).fetchone()
+        if row is None:
+            raise NotFound("线路尚未配置营业日历")
+        return {
+            "route_id": route_id,
+            "calendar_revision": row["current_revision"],
+            "calendar": json.loads(row["definition_json"]),
+            "definition_sha256": row["definition_sha256"],
+            "tzdata_version": row["tzdata_version"],
+            "updated_at": row["updated_at"],
+        }
+
+    def calendar_revisions(self, actor_id: str, route_id: str) -> dict[str, Any]:
+        self._require_any(actor_id, "report.read", "calendar.write")
+        self.route(route_id)
+        rows = self.connection.execute(
+            "SELECT calendar_revision,definition_sha256,tzdata_version,change_summary,created_by,created_at "
+            "FROM route_calendar_revisions WHERE route_id=? ORDER BY calendar_revision",
+            (route_id,),
+        ).fetchall()
+        return {"route_id": route_id, "revisions": [dict(row) for row in rows]}
+
+    def _calendar_schedule(
+        self,
+        route: Mapping[str, Any],
+        departed_at: str,
+    ) -> dict[str, Any] | None:
+        """按当前日历计算可接收时刻；未配置日历的线路保留固定小时数算法。"""
+        calendar_row = self.connection.execute(
+            "SELECT current_revision,definition_json,definition_sha256 FROM route_calendars WHERE route_id=?",
+            (route["route_id"],),
+        ).fetchone()
+        earliest = parse_utc(departed_at) + timedelta(hours=int(route["transit_hours"]))
+        if calendar_row is None:
+            arrival = utc_text(earliest)
+            return {
+                "calendar_revision": None,
+                "calendar_sha256": None,
+                "tzdata_version": None,
+                "window_opens_at": arrival,
+                "scheduled_acceptance_at": arrival,
+                "committed_due_at": arrival,
+                "window_closes_at": arrival,
+            }
+        revision_row = self.connection.execute(
+            "SELECT tzdata_version FROM route_calendar_revisions WHERE route_id=? AND calendar_revision=?",
+            (route["route_id"], calendar_row["current_revision"]),
+        ).fetchone()
+        calendar = BusinessCalendar.from_dict(json.loads(calendar_row["definition_json"]))
+        slot = calendar.next_acceptance(earliest)
+        due_at = slot.closes_at + timedelta(minutes=calendar.sla_grace_minutes)
+        return {
+            "calendar_revision": int(calendar_row["current_revision"]),
+            "calendar_sha256": calendar_row["definition_sha256"],
+            "tzdata_version": revision_row["tzdata_version"],
+            "window_opens_at": utc_text(slot.opens_at),
+            "window_closes_at": utc_text(slot.closes_at),
+            "scheduled_acceptance_at": utc_text(slot.receivable_at),
+            "committed_due_at": utc_text(due_at),
+        }
+
+    def preview_calendar_change(self, actor_id: str, route_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
+        """用候选日历预演在途单的新时刻，但不写库、不改变承诺。"""
+        self._require(actor_id, "calendar.write")
+        route = self.route(route_id)
+        candidate = BusinessCalendar.from_dict(raw)
+        destination = self._destination(route_id)
+        if candidate.timezone_name != destination["timezone"]:
+            raise Conflict("日历时区必须与终端设施时区一致")
+        candidate_json = candidate.definition_json()
+        current = self.connection.execute(
+            "SELECT current_revision FROM route_calendars WHERE route_id=?",
+            (route_id,),
+        ).fetchone()
+        transfers = self.connection.execute(
+            "SELECT t.* FROM transfers t JOIN nominations n ON n.nomination_id=t.nomination_id "
+            "WHERE n.route_id=? AND t.calendar_revision IS NOT NULL AND t.state IN "
+            "('in_transit','partial','quality_hold','overdue') ORDER BY t.transfer_id",
+            (route_id,),
+        ).fetchall()
+        impacts: list[dict[str, Any]] = []
+        for transfer in transfers:
+            frozen_row = self.connection.execute(
+                "SELECT definition_json FROM route_calendar_revisions WHERE route_id=? AND calendar_revision=?",
+                (route_id, transfer["calendar_revision"]),
+            ).fetchone()
+            frozen_calendar = BusinessCalendar.from_dict(json.loads(frozen_row["definition_json"]))
+            earliest = parse_utc(transfer["departed_at"]) + timedelta(hours=int(route["transit_hours"]))
+            frozen_slot = frozen_calendar.next_acceptance(earliest)
+            candidate_slot = candidate.next_acceptance(earliest)
+            candidate_due = candidate_slot.closes_at + timedelta(minutes=candidate.sla_grace_minutes)
+            projected = {
+                "window_opens_at": utc_text(candidate_slot.opens_at),
+                "window_closes_at": utc_text(candidate_slot.closes_at),
+                "scheduled_acceptance_at": utc_text(candidate_slot.receivable_at),
+                "committed_due_at": utc_text(candidate_due),
+            }
+            frozen = {
+                "calendar_revision": transfer["calendar_revision"],
+                "window_opens_at": transfer["window_opens_at"],
+                "window_closes_at": utc_text(frozen_slot.closes_at),
+                "scheduled_acceptance_at": transfer["scheduled_acceptance_at"],
+                "committed_due_at": transfer["committed_due_at"],
+            }
+            changed = any(projected[key] != transfer[key] for key in (
+                "window_opens_at", "scheduled_acceptance_at", "committed_due_at"
+            ))
+            impacts.append({
+                "transfer_id": transfer["transfer_id"],
+                "frozen": frozen,
+                "projected": projected,
+                "changed": changed,
+            })
+        changed_count = sum(1 for item in impacts if item["changed"])
+        return {
+            "route_id": route_id,
+            "current_revision": None if current is None else int(current["current_revision"]),
+            "candidate_calendar": json.loads(candidate_json),
+            "candidate_sha256": candidate.definition_sha256(),
+            "in_transit_impacts": impacts,
+            "changed_count": changed_count,
+            "note": "预览结果不会改变已冻结的在途承诺",
+        }
 
     def announce_outage(
         self,
@@ -433,6 +652,7 @@ class SupplyService:
             raise Conflict("库存不足以完成分配")
         expected_delivery = delivered_after_loss(allocated, int(nomination["loss_basis_points"]))
         departed_at = self._now()
+        schedule = self._calendar_schedule(self.route(nomination["route_id"]), departed_at)
         with transaction(self.connection, immediate=True):
             self.connection.execute(
                 "UPDATE inventory_lots SET available_barrels=?,revision=revision+1 WHERE lot_id=? AND revision=?",
@@ -444,7 +664,9 @@ class SupplyService:
             )
             self.connection.execute(
                 "INSERT INTO transfers(transfer_id,nomination_id,inventory_lot_id,loaded_barrels,"
-                "expected_delivered_barrels,departed_at,created_by,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                "expected_delivered_barrels,departed_at,created_by,created_at,"
+                "calendar_revision,calendar_sha256,tzdata_version,window_opens_at,"
+                "scheduled_acceptance_at,committed_due_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     transfer_id,
                     nomination_id,
@@ -454,16 +676,233 @@ class SupplyService:
                     departed_at,
                     actor_id,
                     departed_at,
+                    schedule["calendar_revision"],
+                    schedule["calendar_sha256"],
+                    schedule["tzdata_version"],
+                    schedule["window_opens_at"],
+                    schedule["scheduled_acceptance_at"],
+                    schedule["committed_due_at"],
                 ),
             )
-            self._audit("transfer", transfer_id, "transfer.dispatched", actor_id, {"nomination_id": nomination_id})
+            self._audit(
+                "transfer",
+                transfer_id,
+                "transfer.dispatched",
+                actor_id,
+                {
+                    "nomination_id": nomination_id,
+                    "calendar_revision": schedule["calendar_revision"],
+                    "calendar_sha256": schedule["calendar_sha256"],
+                    "scheduled_acceptance_at": schedule["scheduled_acceptance_at"],
+                    "committed_due_at": schedule["committed_due_at"],
+                },
+            )
         return {
             "transfer_id": transfer_id,
             "state": "in_transit",
             "loaded_barrels": decimal_text(allocated),
             "expected_delivered_barrels": decimal_text(expected_delivery),
-            "expected_arrival": utc_text(parse_utc(departed_at) + timedelta(hours=int(nomination["transit_hours"]))),
+            "expected_arrival": schedule["scheduled_acceptance_at"],
+            "window_opens_at": schedule["window_opens_at"],
+            "committed_due_at": schedule["committed_due_at"],
+            "calendar_revision": schedule["calendar_revision"],
         }
+
+    def _refresh_overdue(self, transfer: sqlite3.Row, now: datetime | None = None) -> sqlite3.Row:
+        """按冻结承诺重新计算超时；任何时刻调用结果一致，因此重启安全。"""
+        moment = (self.clock.now() if now is None else now).astimezone(timezone.utc)
+        if transfer["state"] in ("completed", "disputed", "delivered"):
+            return transfer
+        is_overdue = bool(transfer["is_overdue"])
+        overdue_since = transfer["overdue_since"]
+        if not is_overdue and transfer["committed_due_at"] is not None:
+            if moment > parse_utc(transfer["committed_due_at"]):
+                is_overdue = True
+                overdue_since = utc_text(moment)
+                # 标记与审计在同一事务内，崩溃不会留下无审计的超时。
+                with transaction(self.connection):
+                    if transfer["state"] == "in_transit":
+                        # 已部分到货或质量待验的单保留原状态；全程在途的单进入 overdue。
+                        self.connection.execute(
+                            "UPDATE transfers SET is_overdue=1,overdue_since=?,state='overdue' "
+                            "WHERE transfer_id=? AND is_overdue=0",
+                            (overdue_since, transfer["transfer_id"]),
+                        )
+                    else:
+                        self.connection.execute(
+                            "UPDATE transfers SET is_overdue=1,overdue_since=? WHERE transfer_id=? AND is_overdue=0",
+                            (overdue_since, transfer["transfer_id"]),
+                        )
+                    self._audit(
+                        "transfer",
+                        transfer["transfer_id"],
+                        "transfer.overdue",
+                        "system",
+                        {"committed_due_at": transfer["committed_due_at"], "evaluated_at": utc_text(moment)},
+                    )
+                transfer = self.connection.execute(
+                    "SELECT * FROM transfers WHERE transfer_id=?", (transfer["transfer_id"],)
+                ).fetchone()
+        return transfer
+
+    def _receipt_totals(self, transfer_id: str) -> dict[str, Decimal]:
+        rows = self.connection.execute(
+            "SELECT stage,quantity_barrels,quality_state FROM transfer_receipts WHERE transfer_id=?",
+            (transfer_id,),
+        ).fetchall()
+        partial = Decimal("0")
+        quality_pending = Decimal("0")
+        final = Decimal("0")
+        final_accepted = Decimal("0")
+        for row in rows:
+            quantity = Decimal(row["quantity_barrels"])
+            if row["stage"] == "partial":
+                partial += quantity
+            elif row["stage"] == "quality_pending":
+                quality_pending += quantity
+            else:
+                final += quantity
+                if row["quality_state"] == "accepted":
+                    final_accepted += quantity
+        return {
+            "partial": partial,
+            "quality_pending": quality_pending,
+            "final": final,
+            "final_accepted": final_accepted,
+        }
+
+    def transfer_status(self, transfer_id: str) -> dict[str, Any]:
+        transfer = self.connection.execute(
+            "SELECT * FROM transfers WHERE transfer_id=?", (transfer_id,)
+        ).fetchone()
+        if transfer is None:
+            raise NotFound("转运记录不存在")
+        transfer = self._refresh_overdue(transfer)
+        totals = self._receipt_totals(transfer_id)
+        return {
+            "transfer_id": transfer_id,
+            "state": transfer["state"],
+            "loaded_barrels": transfer["loaded_barrels"],
+            "expected_delivered_barrels": transfer["expected_delivered_barrels"],
+            "departed_at": transfer["departed_at"],
+            "arrived_at": transfer["arrived_at"],
+            "window_opens_at": transfer["window_opens_at"],
+            "scheduled_acceptance_at": transfer["scheduled_acceptance_at"],
+            "committed_due_at": transfer["committed_due_at"],
+            "is_overdue": bool(transfer["is_overdue"]),
+            "overdue_since": transfer["overdue_since"],
+            "calendar_revision": transfer["calendar_revision"],
+            "calendar_sha256": transfer["calendar_sha256"],
+            "tzdata_version": transfer["tzdata_version"],
+            "partial_received_barrels": decimal_text(quantize_volume(totals["partial"])),
+            "quality_pending_barrels": decimal_text(quantize_volume(totals["quality_pending"])),
+            "final_received_barrels": decimal_text(quantize_volume(totals["final"])),
+            "final_accepted_barrels": decimal_text(quantize_volume(totals["final_accepted"])),
+        }
+
+    def record_receipt(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
+        self._require(actor_id, "receipt.write")
+        receipt = ReceiptRequest.from_dict(raw)
+        transfer = self.connection.execute(
+            "SELECT * FROM transfers WHERE transfer_id=?", (receipt.transfer_id,)
+        ).fetchone()
+        if transfer is None:
+            raise NotFound("转运记录不存在")
+        transfer = self._refresh_overdue(transfer)
+        if transfer["state"] in ("completed", "disputed"):
+            raise InvalidState("转运已结案，不能继续登记到货")
+        duplicate = self.connection.execute(
+            "SELECT transfer_id FROM transfer_receipts WHERE scan_code=?",
+            (receipt.scan_code,),
+        ).fetchone()
+        if duplicate is not None:
+            if duplicate["transfer_id"] != receipt.transfer_id:
+                raise Conflict("扫描码已用于其他转运记录")
+            # 同一转运记录重复扫描：原样返回，不得重复累计。
+            return self._receipt_response(receipt.transfer_id, replayed=True)
+        totals = self._receipt_totals(receipt.transfer_id)
+        quantity = quantize_volume(receipt.quantity_barrels)
+        loaded = Decimal(transfer["loaded_barrels"])
+        if receipt.stage in ("partial", "quality_pending"):
+            already = totals["partial"] + totals["quality_pending"] + totals["final"]
+            if already + quantity > loaded:
+                raise Conflict("累计到货数量不能超过装车数量")
+            quality_state = "pending"
+        else:
+            if totals["final"] > 0:
+                raise Conflict("最终签收已经登记，不能重复最终签收")
+            if quantity > loaded:
+                raise Conflict("最终签收数量不能超过装车数量")
+            quality_state = "accepted"
+        recorded_at = self._now()
+        with transaction(self.connection, immediate=True):
+            self.connection.execute(
+                "INSERT INTO transfer_receipts(transfer_id,stage,quantity_barrels,quality_state,"
+                "scan_code,note,recorded_by,recorded_at) VALUES(?,?,?,?,?,?,?,?)",
+                (
+                    receipt.transfer_id,
+                    receipt.stage,
+                    decimal_text(quantity),
+                    quality_state,
+                    receipt.scan_code,
+                    receipt.note,
+                    actor_id,
+                    recorded_at,
+                ),
+            )
+            if receipt.stage == "partial":
+                new_state = "partial"
+                arrived_at = transfer["arrived_at"] or recorded_at
+            elif receipt.stage == "quality_pending":
+                new_state = "quality_hold"
+                arrived_at = transfer["arrived_at"] or recorded_at
+            else:
+                new_state = "completed"
+                arrived_at = recorded_at
+            self.connection.execute(
+                "UPDATE transfers SET state=?,arrived_at=?,revision=revision+1 WHERE transfer_id=?",
+                (new_state, arrived_at, receipt.transfer_id),
+            )
+            if receipt.stage == "final":
+                self.connection.execute(
+                    "UPDATE nominations SET delivered_barrels=?,state='delivered',revision=revision+1 "
+                    "WHERE nomination_id=?",
+                    (decimal_text(quantity), transfer["nomination_id"]),
+                )
+            self._audit(
+                "transfer",
+                receipt.transfer_id,
+                f"receipt.{receipt.stage}",
+                actor_id,
+                {"scan_code": receipt.scan_code, "quantity_barrels": decimal_text(quantity)},
+            )
+        return self._receipt_response(receipt.transfer_id, replayed=False)
+
+    def _receipt_response(self, transfer_id: str, *, replayed: bool) -> dict[str, Any]:
+        status = self.transfer_status(transfer_id)
+        nomination = self.connection.execute(
+            "SELECT n.nomination_id,n.delivered_barrels,n.state FROM nominations n "
+            "JOIN transfers t ON t.nomination_id=n.nomination_id WHERE t.transfer_id=?",
+            (transfer_id,),
+        ).fetchone()
+        status["idempotent_replay"] = replayed
+        status["nomination"] = dict(nomination) if nomination is not None else None
+        return status
+
+    def sweep_overdue(self, actor_id: str | None = None) -> dict[str, Any]:
+        """批量判定超时；服务重启后重放结果相同，不依赖内存状态。"""
+        if actor_id is not None:
+            self._require(actor_id, "report.read")
+        rows = self.connection.execute(
+            "SELECT * FROM transfers WHERE is_overdue=0 AND committed_due_at IS NOT NULL "
+            "AND state NOT IN ('completed','disputed','delivered') ORDER BY transfer_id"
+        ).fetchall()
+        marked = 0
+        for row in rows:
+            refreshed = self._refresh_overdue(row)
+            if refreshed["is_overdue"]:
+                marked += 1
+        return {"evaluated": len(rows), "marked_overdue": marked, "evaluated_at": self._now()}
 
     def create_scenario(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
         self._require(actor_id, "scenario.write")
