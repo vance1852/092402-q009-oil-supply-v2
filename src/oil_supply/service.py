@@ -11,7 +11,17 @@ from typing import Any, Iterable, Mapping
 
 from .clock import SystemClock, parse_utc, utc_text
 from .errors import Conflict, Forbidden, InvalidState, NotFound, ValidationFailed
-from .models import IndexQuote, Facility, InventoryLot, NominationRequest, Route, SupplyScenario
+from .models import (
+    IndexQuote,
+    Facility,
+    InventoryLot,
+    NominationRequest,
+    Route,
+    RouteCalendarSpec,
+    SupplyScenario,
+    TransferReceiptRequest,
+)
+from .schedule import RouteCalendar, next_receivable
 from .planning import (
     AllocationRequest,
     PricePoint,
@@ -227,6 +237,81 @@ class SupplyService:
             raise NotFound("线路不存在")
         return dict(row)
 
+    def register_calendar(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
+        """登记线路接收日历的新版本；已发运的转运继续沿用冻结的旧版本。"""
+        self._require(actor_id, "catalog.write")
+        spec = RouteCalendarSpec.from_dict(raw)
+        self.route(spec.route_id)
+        calendar = RouteCalendar.from_snapshot(
+            {
+                "timezone": spec.timezone,
+                "business_days": list(spec.business_days),
+                "windows": [{"start": start, "end": end} for start, end in spec.windows],
+                "closed_dates": list(spec.closed_dates),
+                "open_dates": list(spec.open_dates),
+            }
+        )
+        snapshot = calendar.as_snapshot()
+        with transaction(self.connection, immediate=True):
+            row = self.connection.execute(
+                "SELECT max(version) AS latest FROM route_calendars WHERE route_id=?",
+                (spec.route_id,),
+            ).fetchone()
+            version = 1 if row["latest"] is None else int(row["latest"]) + 1
+            self.connection.execute(
+                "INSERT INTO route_calendars(route_id,version,timezone,business_days_json,windows_json,"
+                "closed_dates_json,open_dates_json,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                (
+                    spec.route_id,
+                    version,
+                    snapshot["timezone"],
+                    canonical_json(snapshot["business_days"]),
+                    canonical_json(snapshot["windows"]),
+                    canonical_json(snapshot["closed_dates"]),
+                    canonical_json(snapshot["open_dates"]),
+                    actor_id,
+                    self._now(),
+                ),
+            )
+            self._audit("route", spec.route_id, "calendar.registered", actor_id, {"version": version})
+        return {"route_id": spec.route_id, "version": version, "calendar": snapshot}
+
+    def _calendar_row(self, route_id: str, version: int | None = None) -> sqlite3.Row | None:
+        if version is None:
+            return self.connection.execute(
+                "SELECT * FROM route_calendars WHERE route_id=? ORDER BY version DESC LIMIT 1",
+                (route_id,),
+            ).fetchone()
+        return self.connection.execute(
+            "SELECT * FROM route_calendars WHERE route_id=? AND version=?",
+            (route_id, version),
+        ).fetchone()
+
+    @staticmethod
+    def _calendar_from_row(row: sqlite3.Row) -> RouteCalendar:
+        return RouteCalendar.from_snapshot(
+            {
+                "timezone": row["timezone"],
+                "business_days": json.loads(row["business_days_json"]),
+                "windows": json.loads(row["windows_json"]),
+                "closed_dates": json.loads(row["closed_dates_json"]),
+                "open_dates": json.loads(row["open_dates_json"]),
+            }
+        )
+
+    def latest_calendar(self, route_id: str) -> dict[str, Any]:
+        self.route(route_id)
+        row = self._calendar_row(route_id)
+        if row is None:
+            raise NotFound("线路尚未配置接收日历")
+        return {
+            "route_id": route_id,
+            "version": int(row["version"]),
+            "calendar": self._calendar_from_row(row).as_snapshot(),
+            "created_by": row["created_by"],
+            "created_at": row["created_at"],
+        }
+
     def announce_outage(
         self,
         actor_id: str,
@@ -433,6 +518,19 @@ class SupplyService:
             raise Conflict("库存不足以完成分配")
         expected_delivery = delivered_after_loss(allocated, int(nomination["loss_basis_points"]))
         departed_at = self._now()
+        transit_hours = int(nomination["transit_hours"])
+        transit_eta = parse_utc(departed_at) + timedelta(hours=transit_hours)
+        calendar_row = self._calendar_row(nomination["route_id"])
+        calendar_version: int | None = None
+        calendar_snapshot: str | None = None
+        if calendar_row is None:
+            # 线路未配置接收日历：沿用旧的固定小时数规则
+            expected_arrival = transit_eta
+        else:
+            calendar = self._calendar_from_row(calendar_row)
+            expected_arrival = next_receivable(calendar, transit_eta)
+            calendar_version = int(calendar_row["version"])
+            calendar_snapshot = canonical_json(calendar.as_snapshot())
         with transaction(self.connection, immediate=True):
             self.connection.execute(
                 "UPDATE inventory_lots SET available_barrels=?,revision=revision+1 WHERE lot_id=? AND revision=?",
@@ -444,7 +542,8 @@ class SupplyService:
             )
             self.connection.execute(
                 "INSERT INTO transfers(transfer_id,nomination_id,inventory_lot_id,loaded_barrels,"
-                "expected_delivered_barrels,departed_at,created_by,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                "expected_delivered_barrels,departed_at,transit_eta,expected_arrival,calendar_version,"
+                "calendar_snapshot_json,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     transfer_id,
                     nomination_id,
@@ -452,17 +551,190 @@ class SupplyService:
                     decimal_text(allocated),
                     decimal_text(expected_delivery),
                     departed_at,
+                    utc_text(transit_eta),
+                    utc_text(expected_arrival),
+                    calendar_version,
+                    calendar_snapshot,
                     actor_id,
                     departed_at,
                 ),
             )
-            self._audit("transfer", transfer_id, "transfer.dispatched", actor_id, {"nomination_id": nomination_id})
+            self._audit(
+                "transfer",
+                transfer_id,
+                "transfer.dispatched",
+                actor_id,
+                {"nomination_id": nomination_id, "calendar_version": calendar_version},
+            )
         return {
             "transfer_id": transfer_id,
             "state": "in_transit",
             "loaded_barrels": decimal_text(allocated),
             "expected_delivered_barrels": decimal_text(expected_delivery),
-            "expected_arrival": utc_text(parse_utc(departed_at) + timedelta(hours=int(nomination["transit_hours"]))),
+            "transit_eta": utc_text(transit_eta),
+            "expected_arrival": utc_text(expected_arrival),
+            "calendar_version": calendar_version,
+        }
+
+    def register_receipt(self, actor_id: str, transfer_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
+        """登记终端收货：部分到货、质量待验或最终签收。
+
+        每次扫描携带幂等键，重复扫描重放首次响应、不重复累计；只有
+        final 签收的数量会结转提名并结案转运。
+        """
+        self._require(actor_id, "transfer.write")
+        receipt = TransferReceiptRequest.from_dict(raw)
+        request_digest = digest({"transfer_id": transfer_id, **dict(raw)})
+        stored = self.connection.execute(
+            "SELECT request_sha256,response_json FROM supply_idempotency WHERE scope='receipt' AND idempotency_key=?",
+            (receipt.idempotency_key,),
+        ).fetchone()
+        if stored is not None:
+            if stored["request_sha256"] != request_digest:
+                raise Conflict("幂等键对应不同收货内容")
+            return json.loads(stored["response_json"])
+        transfer = self.connection.execute(
+            "SELECT * FROM transfers WHERE transfer_id=?", (transfer_id,)
+        ).fetchone()
+        if transfer is None:
+            raise NotFound("转运不存在")
+        if transfer["state"] != "in_transit":
+            raise InvalidState("转运已结案，不能登记收货")
+        recorded_at = self._now()
+        quantity = decimal_text(receipt.quantity_barrels)
+        try:
+            with transaction(self.connection, immediate=True):
+                cursor = self.connection.execute(
+                    "INSERT INTO transfer_receipts(transfer_id,kind,quantity_barrels,idempotency_key,note,"
+                    "recorded_by,recorded_at) VALUES(?,?,?,?,?,?,?)",
+                    (
+                        transfer_id,
+                        receipt.kind,
+                        quantity,
+                        receipt.idempotency_key,
+                        receipt.note,
+                        actor_id,
+                        recorded_at,
+                    ),
+                )
+                receipt_id = int(cursor.lastrowid)
+                if receipt.kind == "final":
+                    self.connection.execute(
+                        "UPDATE transfers SET state='delivered',arrived_at=?,revision=revision+1 "
+                        "WHERE transfer_id=? AND state='in_transit'",
+                        (recorded_at, transfer_id),
+                    )
+                    self.connection.execute(
+                        "UPDATE nominations SET delivered_barrels=?,state='delivered',revision=revision+1 "
+                        "WHERE nomination_id=? AND state='in_transit'",
+                        (quantity, transfer["nomination_id"]),
+                    )
+                response = {
+                    "receipt_id": receipt_id,
+                    "transfer_id": transfer_id,
+                    "kind": receipt.kind,
+                    "quantity_barrels": quantity,
+                    "recorded_at": recorded_at,
+                    "transfer_state": "delivered" if receipt.kind == "final" else "in_transit",
+                }
+                self.connection.execute(
+                    "INSERT INTO supply_idempotency(scope,idempotency_key,request_sha256,response_json,created_at) "
+                    "VALUES('receipt',?,?,?,?)",
+                    (receipt.idempotency_key, request_digest, canonical_json(response), recorded_at),
+                )
+                self._audit(
+                    "transfer",
+                    transfer_id,
+                    f"transfer.receipt.{receipt.kind}",
+                    actor_id,
+                    {"receipt_id": receipt_id, "quantity_barrels": quantity},
+                )
+        except sqlite3.IntegrityError as exc:
+            raise Conflict("收货幂等键冲突") from exc
+        return response
+
+    def transfer_detail(self, transfer_id: str) -> dict[str, Any]:
+        row = self.connection.execute(
+            "SELECT t.*,n.route_id,n.shipper_id FROM transfers t "
+            "JOIN nominations n ON n.nomination_id=t.nomination_id WHERE t.transfer_id=?",
+            (transfer_id,),
+        ).fetchone()
+        if row is None:
+            raise NotFound("转运不存在")
+        receipts = self.connection.execute(
+            "SELECT * FROM transfer_receipts WHERE transfer_id=? ORDER BY receipt_id",
+            (transfer_id,),
+        ).fetchall()
+        totals = {"partial": Decimal(0), "quality_hold": Decimal(0), "final": Decimal(0)}
+        for item in receipts:
+            totals[item["kind"]] += Decimal(item["quantity_barrels"])
+        expected = row["expected_arrival"]
+        overdue = row["state"] == "in_transit" and expected is not None and parse_utc(expected) < self.clock.now()
+        return {
+            **dict(row),
+            "receipts": [dict(item) for item in receipts],
+            "received_totals": {
+                "partial_barrels": decimal_text(totals["partial"]),
+                "quality_hold_barrels": decimal_text(totals["quality_hold"]),
+                "final_barrels": decimal_text(totals["final"]),
+            },
+            "overdue": overdue,
+        }
+
+    def overdue_transfers(self, as_of: str | None = None) -> dict[str, Any]:
+        """列出已超过承诺接收时刻仍未结案的转运；判断完全基于落库时刻。"""
+        try:
+            moment = self.clock.now() if as_of is None else parse_utc(as_of, "as_of")
+        except ValueError as exc:
+            raise ValidationFailed(str(exc)) from exc
+        rows = self.connection.execute(
+            "SELECT t.transfer_id,t.nomination_id,t.expected_arrival,t.departed_at,n.route_id,n.shipper_id "
+            "FROM transfers t JOIN nominations n ON n.nomination_id=t.nomination_id "
+            "WHERE t.state='in_transit' AND t.expected_arrival IS NOT NULL AND t.expected_arrival<? "
+            "ORDER BY t.expected_arrival,t.transfer_id",
+            (utc_text(moment),),
+        ).fetchall()
+        items = []
+        for row in rows:
+            overdue_seconds = Decimal(str((moment - parse_utc(row["expected_arrival"])).total_seconds()))
+            items.append(
+                {
+                    **dict(row),
+                    "overdue_hours": decimal_text(quantize_volume(overdue_seconds / Decimal(3600))),
+                }
+            )
+        return {"as_of": utc_text(moment), "overdue": items}
+
+    def preview_calendar_impact(self, transfer_id: str) -> dict[str, Any]:
+        """用线路最新日历重算在途承诺，只读预览，不改变冻结的预计到达。"""
+        row = self.connection.execute(
+            "SELECT t.*,n.route_id FROM transfers t JOIN nominations n ON n.nomination_id=t.nomination_id "
+            "WHERE t.transfer_id=?",
+            (transfer_id,),
+        ).fetchone()
+        if row is None:
+            raise NotFound("转运不存在")
+        calendar_row = self._calendar_row(row["route_id"])
+        if calendar_row is None:
+            raise NotFound("线路尚未配置接收日历")
+        calendar = self._calendar_from_row(calendar_row)
+        transit_eta = row["transit_eta"]
+        if transit_eta is None:
+            route = self.route(row["route_id"])
+            transit_eta = utc_text(parse_utc(row["departed_at"]) + timedelta(hours=int(route["transit_hours"])))
+        projected = next_receivable(calendar, parse_utc(transit_eta))
+        frozen = parse_utc(row["expected_arrival"])
+        shift_seconds = Decimal(str((projected - frozen).total_seconds()))
+        return {
+            "transfer_id": transfer_id,
+            "route_id": row["route_id"],
+            "state": row["state"],
+            "frozen_calendar_version": row["calendar_version"],
+            "latest_calendar_version": int(calendar_row["version"]),
+            "frozen_expected_arrival": row["expected_arrival"],
+            "projected_expected_arrival": utc_text(projected),
+            "shift_minutes": decimal_text(quantize_volume(shift_seconds / Decimal(60))),
+            "changed": projected != frozen,
         }
 
     def create_scenario(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:

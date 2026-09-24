@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import sqlite3
 from contextlib import contextmanager
+from datetime import timedelta
 from pathlib import Path
 from typing import Iterator
+
+from .clock import parse_utc, utc_text
 
 
 SCHEMA = """
@@ -142,12 +145,43 @@ CREATE TABLE IF NOT EXISTS transfers (
     loaded_barrels TEXT NOT NULL,
     expected_delivered_barrels TEXT NOT NULL,
     departed_at TEXT NOT NULL,
+    transit_eta TEXT,
+    expected_arrival TEXT,
+    calendar_version INTEGER,
+    calendar_snapshot_json TEXT,
     arrived_at TEXT,
     state TEXT NOT NULL DEFAULT 'in_transit' CHECK(state IN ('in_transit','delivered','disputed')),
     revision INTEGER NOT NULL DEFAULT 1,
     created_by TEXT NOT NULL REFERENCES supply_users(user_id),
     created_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS route_calendars (
+    route_id TEXT NOT NULL REFERENCES routes(route_id),
+    version INTEGER NOT NULL,
+    timezone TEXT NOT NULL,
+    business_days_json TEXT NOT NULL,
+    windows_json TEXT NOT NULL,
+    closed_dates_json TEXT NOT NULL,
+    open_dates_json TEXT NOT NULL,
+    created_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(route_id, version)
+);
+
+CREATE TABLE IF NOT EXISTS transfer_receipts (
+    receipt_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    transfer_id TEXT NOT NULL REFERENCES transfers(transfer_id),
+    kind TEXT NOT NULL CHECK(kind IN ('partial','quality_hold','final')),
+    quantity_barrels TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    note TEXT NOT NULL DEFAULT '',
+    recorded_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    recorded_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_transfer_receipts_transfer
+ON transfer_receipts(transfer_id, receipt_id);
 
 CREATE TABLE IF NOT EXISTS supply_scenarios (
     scenario_id TEXT PRIMARY KEY,
@@ -209,6 +243,37 @@ def connect(path: str | Path) -> sqlite3.Connection:
 
 def initialize(connection: sqlite3.Connection) -> None:
     connection.executescript(SCHEMA)
+    _migrate_transfers(connection)
+
+
+# 旧版转运记录只有 UTC 离港时间和线路上的固定小时数；升级时补上新列，
+# 并按旧规则回填预计到达，让在途记录在服务重启后仍能判断超时。
+_TRANSFER_COLUMNS = {
+    "transit_eta": "ALTER TABLE transfers ADD COLUMN transit_eta TEXT",
+    "expected_arrival": "ALTER TABLE transfers ADD COLUMN expected_arrival TEXT",
+    "calendar_version": "ALTER TABLE transfers ADD COLUMN calendar_version INTEGER",
+    "calendar_snapshot_json": "ALTER TABLE transfers ADD COLUMN calendar_snapshot_json TEXT",
+}
+
+
+def _migrate_transfers(connection: sqlite3.Connection) -> None:
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(transfers)")}
+    missing = [name for name in _TRANSFER_COLUMNS if name not in columns]
+    for name in missing:
+        connection.execute(_TRANSFER_COLUMNS[name])
+    if "expected_arrival" not in missing:
+        return
+    rows = connection.execute(
+        "SELECT t.transfer_id,t.departed_at,r.transit_hours FROM transfers t "
+        "JOIN nominations n ON n.nomination_id=t.nomination_id "
+        "JOIN routes r ON r.route_id=n.route_id WHERE t.transit_eta IS NULL"
+    ).fetchall()
+    for row in rows:
+        eta = parse_utc(row["departed_at"], "departed_at") + timedelta(hours=int(row["transit_hours"]))
+        connection.execute(
+            "UPDATE transfers SET transit_eta=?,expected_arrival=? WHERE transfer_id=?",
+            (utc_text(eta), utc_text(eta), row["transfer_id"]),
+        )
 
 
 @contextmanager

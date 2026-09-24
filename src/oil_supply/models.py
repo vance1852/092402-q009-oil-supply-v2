@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, time
 from decimal import Decimal, InvalidOperation
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from .clock import parse_utc
 from .errors import ValidationFailed
@@ -16,6 +16,8 @@ IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{1,63}$")
 CRUDE_GRADES = {"BRENT", "WTI", "DUBAI", "ESPO", "URAL", "CUSTOM"}
 PRODUCTS = {"crude", "gasoline-92", "gasoline-95", "diesel", "jet-fuel", "condensate"}
 ROUTE_KINDS = {"pipeline", "terminal", "refinery", "storage", "truck-rack"}
+WEEKDAY_CODES = ("MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN")
+RECEIPT_KINDS = ("partial", "quality_hold", "final")
 
 
 def required_text(value: object, field: str, maximum: int = 256) -> str:
@@ -68,6 +70,20 @@ def date_text(value: object, field: str) -> str:
         return date.fromisoformat(result).isoformat()
     except ValueError as exc:
         raise ValidationFailed(f"{field} 必须是 YYYY-MM-DD 日期") from exc
+
+
+def time_text(value: object, field: str) -> str:
+    result = required_text(value, field, 5)
+    try:
+        return time.fromisoformat(result).isoformat(timespec="minutes")
+    except ValueError as exc:
+        raise ValidationFailed(f"{field} 必须是 HH:MM 时间") from exc
+
+
+def _date_list(value: object, field: str) -> tuple[str, ...]:
+    if not isinstance(value, Sequence) or isinstance(value, str):
+        raise ValidationFailed(f"{field} 必须是日期数组")
+    return tuple(sorted({date_text(item, f"{field} 元素") for item in value}))
 
 
 @dataclass(frozen=True, slots=True)
@@ -259,4 +275,100 @@ class SupplyScenario:
             ),
             route_capacity_changes=parsed_routes,
             demand_changes=parsed_demand,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class RouteCalendarSpec:
+    """线路接收日历的一次版本登记。"""
+
+    route_id: str
+    timezone: str
+    business_days: tuple[str, ...]
+    windows: tuple[tuple[str, str], ...]
+    closed_dates: tuple[str, ...]
+    open_dates: tuple[str, ...]
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "RouteCalendarSpec":
+        timezone = required_text(raw.get("timezone"), "timezone", 64)
+        if "/" not in timezone and timezone != "UTC":
+            raise ValidationFailed("timezone 必须是 IANA 时区或 UTC")
+        days_raw = raw.get("business_days")
+        if not isinstance(days_raw, Sequence) or isinstance(days_raw, str) or not days_raw:
+            raise ValidationFailed("business_days 必须是非空数组")
+        days: set[str] = set()
+        for item in days_raw:
+            code = required_text(item, "business_days 元素", 3).upper()
+            if code not in WEEKDAY_CODES:
+                raise ValidationFailed("business_days 必须是 MON 到 SUN 的代码")
+            days.add(code)
+        windows_raw = raw.get("windows")
+        if not isinstance(windows_raw, Sequence) or isinstance(windows_raw, str) or not windows_raw:
+            raise ValidationFailed("windows 必须是非空数组")
+        windows: list[tuple[str, str]] = []
+        for item in windows_raw:
+            if not isinstance(item, Mapping):
+                raise ValidationFailed("windows 元素必须是含 start 和 end 的对象")
+            start = time_text(item.get("start"), "windows.start")
+            end = time_text(item.get("end"), "windows.end")
+            if start == end:
+                raise ValidationFailed("交接窗口的 start 和 end 不能相同")
+            windows.append((start, end))
+        _check_window_overlap(windows)
+        closed = _date_list(raw.get("closed_dates", []), "closed_dates")
+        opened = _date_list(raw.get("open_dates", []), "open_dates")
+        if set(closed) & set(opened):
+            raise ValidationFailed("closed_dates 和 open_dates 不能包含同一天")
+        return cls(
+            route_id=identifier(raw.get("route_id"), "route_id"),
+            timezone=timezone,
+            business_days=tuple(code for code in WEEKDAY_CODES if code in days),
+            windows=tuple(sorted(windows)),
+            closed_dates=closed,
+            open_dates=opened,
+        )
+
+
+def _check_window_overlap(windows: Sequence[tuple[str, str]]) -> None:
+    """拒绝互相重叠的交接窗口，跨午夜窗口展开到次日分钟轴上检查。"""
+    intervals: list[tuple[int, int]] = []
+    for start, end in windows:
+        first = int(start[:2]) * 60 + int(start[3:])
+        last = int(end[:2]) * 60 + int(end[3:])
+        if last <= first:
+            last += 24 * 60
+        intervals.append((first, last))
+        if last > 24 * 60:
+            intervals.append((0, last - 24 * 60))
+    intervals.sort()
+    for previous, current in zip(intervals, intervals[1:]):
+        if current[0] < previous[1]:
+            raise ValidationFailed("交接窗口不能互相重叠")
+
+
+@dataclass(frozen=True, slots=True)
+class TransferReceiptRequest:
+    """终端对一次转运的收货登记。"""
+
+    kind: str
+    quantity_barrels: Decimal
+    idempotency_key: str
+    note: str
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "TransferReceiptRequest":
+        kind = required_text(raw.get("kind"), "kind", 16)
+        if kind not in RECEIPT_KINDS:
+            raise ValidationFailed("kind 必须是 partial、quality_hold 或 final")
+        note = raw.get("note", "")
+        if not isinstance(note, str) or len(note) > 256:
+            raise ValidationFailed("note 不能超过 256 个字符")
+        return cls(
+            kind=kind,
+            quantity_barrels=decimal_value(
+                raw.get("quantity_barrels"), "quantity_barrels", minimum=Decimal("0.001")
+            ),
+            idempotency_key=identifier(raw.get("idempotency_key"), "idempotency_key"),
+            note=note.strip(),
         )

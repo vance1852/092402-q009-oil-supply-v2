@@ -23,14 +23,23 @@ def run(workspace: Path) -> dict[str, object]:
     service.create_facility("plan", {"facility_id": "field-a", "name": "北部油田", "kind": "storage", "timezone": "Asia/Shanghai", "capacity_barrels": "500000"})
     service.create_facility("plan", {"facility_id": "terminal-b", "name": "沿海终端", "kind": "terminal", "timezone": "Asia/Shanghai", "capacity_barrels": "800000"})
     service.create_route("plan", {"route_id": "pipe-a-b", "origin_id": "field-a", "destination_id": "terminal-b", "product": "crude", "daily_capacity": "100000", "loss_basis_points": 25, "transit_hours": 36})
+    calendar = service.register_calendar("plan", {"route_id": "pipe-a-b", "timezone": "Asia/Shanghai", "business_days": ["MON", "TUE", "WED", "THU", "FRI"], "windows": [{"start": "08:00", "end": "18:00"}], "closed_dates": ["2026-10-01"], "open_dates": []})
     service.add_inventory_lot("dispatch", {"lot_id": "lot-001", "facility_id": "field-a", "product": "crude", "grade": "BRENT", "quantity_barrels": "150000", "unit_cost_usd": "91.25", "received_at": "2026-09-24T06:00:00Z"})
     service.submit_nomination("dispatch", {"nomination_id": "nom-001", "route_id": "pipe-a-b", "shipper_id": "refinery-east", "service_date": "2026-09-25", "requested_barrels": "80000", "priority": 10, "idempotency_key": "nom-key-001"})
     allocation = service.allocate("dispatch", "pipe-a-b", "2026-09-25")
     transfer = service.dispatch_transfer("dispatch", "transfer-001", "nom-001", "lot-001", 2)
+    clock = service.clock
+    assert isinstance(clock, FrozenClock)
+    clock.advance(days=4, hours=4)
+    overdue_before = service.overdue_transfers()
+    partial = service.register_receipt("dispatch", "transfer-001", {"kind": "partial", "quantity_barrels": "30000", "idempotency_key": "scan-001", "note": "首批卸货"})
+    final = service.register_receipt("dispatch", "transfer-001", {"kind": "final", "quantity_barrels": "49800", "idempotency_key": "scan-002", "note": "最终签收"})
+    detail = service.transfer_detail("transfer-001")
+    overdue_after = service.overdue_transfers()
     service.create_scenario("plan", {"scenario_id": "pipeline-restart", "name": "关键管道恢复与需求回落", "price_index_drop_percent": "9", "route_capacity_changes": {"pipe-a-b": "20"}, "demand_changes": {"field-a:crude": "-5"}})
     service.approve_scenario("risk", "pipeline-restart", 1)
     scenario = service.run_scenario("plan", "pipeline-restart", "2026-09-23")
-    result = {"status": "ok", "price": service.price_summary("BRENT"), "allocation_id": allocation["allocation_id"], "transfer": transfer, "scenario_run_id": scenario["run_id"], "audit": service.audit_chain("audit"), "workspace": workspace.name}
+    result = {"status": "ok", "price": service.price_summary("BRENT"), "calendar": calendar, "allocation_id": allocation["allocation_id"], "transfer": transfer, "receipts": [partial, final], "transfer_detail": detail, "overdue_before_receipt": len(overdue_before["overdue"]), "overdue_after_receipt": len(overdue_after["overdue"]), "scenario_run_id": scenario["run_id"], "audit": service.audit_chain("audit"), "workspace": workspace.name}
     connection.close()
     return result
 

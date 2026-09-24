@@ -65,6 +65,10 @@ class JsonApplication:
                 return Response(201, self.service.create_facility(actor, payload))
             if method == "POST" and path == "/routes":
                 return Response(201, self.service.create_route(actor, payload))
+            if method == "POST" and len(parts) == 3 and parts[0] == "routes" and parts[2] == "calendars":
+                return Response(201, self.service.register_calendar(actor, {**payload, "route_id": parts[1]}))
+            if method == "GET" and len(parts) == 3 and parts[0] == "routes" and parts[2] == "calendar":
+                return Response(200, self.service.latest_calendar(parts[1]))
             if method == "POST" and len(parts) == 3 and parts[0] == "routes" and parts[2] == "outages":
                 return Response(201, self.service.announce_outage(actor, parts[1], payload["starts_at"], payload.get("ends_at"), payload["capacity_percent"], payload["reason"]))
             if method == "POST" and path == "/inventory/lots":
@@ -77,6 +81,14 @@ class JsonApplication:
                 return Response(200, self.service.allocate(actor, parts[1], payload["service_date"]))
             if method == "POST" and path == "/transfers":
                 return Response(201, self.service.dispatch_transfer(actor, payload["transfer_id"], payload["nomination_id"], payload["lot_id"], int(payload["expected_revision"])))
+            if method == "GET" and len(parts) == 2 and parts[0] == "transfers" and parts[1] == "overdue":
+                return Response(200, self.service.overdue_transfers(query.get("as_of", [None])[0]))
+            if method == "POST" and len(parts) == 3 and parts[0] == "transfers" and parts[2] == "receipts":
+                return Response(201, self.service.register_receipt(actor, parts[1], payload))
+            if method == "GET" and len(parts) == 3 and parts[0] == "transfers" and parts[2] == "calendar-preview":
+                return Response(200, self.service.preview_calendar_impact(parts[1]))
+            if method == "GET" and len(parts) == 2 and parts[0] == "transfers":
+                return Response(200, self.service.transfer_detail(parts[1]))
             if method == "POST" and path == "/scenarios":
                 return Response(201, self.service.create_scenario(actor, payload))
             if method == "POST" and len(parts) == 3 and parts[0] == "scenarios" and parts[2] == "approve":
